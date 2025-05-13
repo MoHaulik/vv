@@ -108,6 +108,7 @@
     let camera, scene, renderer;
     let controllers = [];
     let selectedObject = null;
+    let markedObject = null;
     let xrSession = null;
     let interactionMode = 'none';
     let activeControllers = new Set();
@@ -120,6 +121,10 @@
     let plane;
     let videoTexture;
     let videoElement;
+    
+    // Track if select button is being held down
+    let selectHoldTimer = null;
+    const HOLD_DURATION = 500; // milliseconds to consider a hold
 
     // Initialize WebXR components
     function init() {
@@ -162,8 +167,8 @@
       videoElement.muted = true;
       videoElement.playsInline = true;
       
-      // Earth timelapse video from Pexels (sample source)
-      videoElement.src = "https://cdn.glitch.me/3e633aed-aec3-4e24-a2a6-d6640ae796bc%2Fearth-spinning.mp4";
+      // Use local video file instead of remote URL
+      videoElement.src = "smartbackground.mp4";
       
       // Create a texture from the video
       videoTexture = new THREE.VideoTexture(videoElement);
@@ -193,7 +198,20 @@
       scene.add(halfSphere);
       
       // Start video playback
-      videoElement.play();
+      videoElement.play().catch(error => {
+        console.warn('Video autoplay failed:', error);
+        updateStatus('Tap to start video playback');
+        
+        // Add a tap event to start video on iOS devices
+        document.addEventListener('click', function startVideo() {
+          videoElement.play().then(() => {
+            updateStatus('Video started!');
+            document.removeEventListener('click', startVideo);
+          }).catch(err => {
+            console.error('Video playback failed after tap:', err);
+          });
+        });
+      });
     }
     
     // Create a plane with small character balls
@@ -312,7 +330,7 @@
       // Handle session end
       session.addEventListener('end', onSessionEnd);
       
-      updateStatus('Welcome to AR Half-Sphere World! Grab objects to move them.');
+      updateStatus('Welcome to AR Half-Sphere World! Tap objects to mark them, hold to grab and move.');
     }
     
     // End AR session
@@ -339,6 +357,7 @@
       
       // Reset state
       selectedObject = null;
+      markedObject = null;
       characters = [];
       controllers = [];
       activeControllers.clear();
@@ -401,14 +420,12 @@
       // Add this controller to active set
       activeControllers.add(controller.userData.id);
       
-      if (interactionMode === 'none') {
-        // Try to find an object to interact with
-        const intersectedObject = findIntersectedObject(controllerPos);
-        
-        if (intersectedObject) {
-          selectedObject = intersectedObject;
+      // Detect if button is being held down
+      selectHoldTimer = setTimeout(() => {
+        // This is a hold gesture - start moving the object
+        if (markedObject) {
+          selectedObject = markedObject;
           interactionMode = 'move';
-          highlightObject(selectedObject, true);
           
           // Store initial controller position
           initialControllerPositions[controller.userData.id] = controllerPos.clone();
@@ -420,33 +437,28 @@
           );
           
           updateStatus('Moving object. Use both hands to resize/rotate.');
+        } else {
+          // Try to find an object to interact with
+          const intersectedObject = findIntersectedObject(controllerPos);
+          
+          if (intersectedObject) {
+            selectedObject = intersectedObject;
+            interactionMode = 'move';
+            highlightObject(selectedObject, true);
+            
+            // Store initial controller position
+            initialControllerPositions[controller.userData.id] = controllerPos.clone();
+            
+            // Calculate offset from controller to object center
+            selectedObject.userData.offset = new THREE.Vector3().subVectors(
+              selectedObject.position,
+              controllerPos
+            );
+            
+            updateStatus('Moving object. Use both hands to resize/rotate.');
+          }
         }
-      }
-      else if (interactionMode === 'move' && activeControllers.size === 2) {
-        // Transition to transform mode
-        interactionMode = 'transform';
-        
-        // Store positions of both controllers
-        controllers.forEach(ctrl => {
-          const pos = new THREE.Vector3();
-          ctrl.getWorldPosition(pos);
-          initialControllerPositions[ctrl.userData.id] = pos.clone();
-        });
-        
-        // Calculate initial values for transform operations
-        initialDistance = getControllerDistance();
-        initialScale.copy(selectedObject.scale);
-        
-        // Calculate initial angle between controllers
-        const leftPos = initialControllerPositions[0];
-        const rightPos = initialControllerPositions[1];
-        if (leftPos && rightPos) {
-          const vector = new THREE.Vector3().subVectors(rightPos, leftPos);
-          initialRotation = Math.atan2(vector.x, vector.z);
-        }
-        
-        updateStatus('Resize/rotate mode active.');
-      }
+      }, HOLD_DURATION);
     }
     
     function onSelectEnd(event) {
@@ -454,6 +466,39 @@
       
       // Remove controller from active set
       activeControllers.delete(controller.userData.id);
+      
+      // Clear hold timer if it exists
+      if (selectHoldTimer) {
+        clearTimeout(selectHoldTimer);
+        selectHoldTimer = null;
+        
+        // If we're not in move mode, this was a quick tap - mark the object
+        if (interactionMode === 'none') {
+          const controllerPos = new THREE.Vector3();
+          controller.getWorldPosition(controllerPos);
+          
+          // Find object under cursor
+          const intersectedObject = findIntersectedObject(controllerPos);
+          
+          if (intersectedObject) {
+            // If we already have a marked object, unmark it
+            if (markedObject) {
+              highlightObject(markedObject, false);
+            }
+            
+            // If tapping the same object, toggle mark off
+            if (markedObject === intersectedObject) {
+              markedObject = null;
+              updateStatus('Object unmarked.');
+            } else {
+              // Mark new object
+              markedObject = intersectedObject;
+              highlightObject(markedObject, true);
+              updateStatus('Object marked. Hold select to grab it.');
+            }
+          }
+        }
+      }
       
       if (interactionMode === 'transform') {
         if (activeControllers.size === 1) {
@@ -484,15 +529,21 @@
     }
     
     function resetInteraction() {
-      if (selectedObject) {
+      // If we have a selected object that's not marked, unhighlight it
+      if (selectedObject && selectedObject !== markedObject) {
         highlightObject(selectedObject, false);
+      }
+      
+      // If we have a marked object, keep it highlighted
+      if (markedObject) {
+        highlightObject(markedObject, true);
       }
       
       selectedObject = null;
       interactionMode = 'none';
       activeControllers.clear();
       initialControllerPositions = {};
-      updateStatus('Object placed. Select again to move.');
+      updateStatus(markedObject ? 'Object still marked. Hold select to grab it.' : 'Tap objects to mark them.');
     }
     
     function highlightObject(object, isHighlighted) {
@@ -647,7 +698,7 @@
     function render(timestamp, frame) {
       // Animate characters not being interacted with
       characters.forEach(character => {
-        if (character !== selectedObject) {
+        if (character !== selectedObject && character !== markedObject) {
           character.rotation.y += 0.01;
         }
       });
